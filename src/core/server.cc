@@ -31,14 +31,18 @@
 #include <algorithm>
 #include <csignal>
 #include <iostream>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
+#include "src/backends/backend/triton_backend_config.h"
 #include "src/backends/backend/triton_backend_manager.h"
 #include "src/core/backend.h"
 #include "src/core/constants.h"
 #include "src/core/cuda_utils.h"
+#include "src/core/filesystem.h"
 #include "src/core/logging.h"
 #include "src/core/model_config.h"
 #include "src/core/model_config.pb.h"
@@ -110,82 +114,6 @@ InferenceServer::InferenceServer()
 }
 
 Status
-InferenceServer::PrintBackendAndModelSummary()
-{
-  // Backends Summary
-  std::vector<std::string> backend_headers;
-  backend_headers.emplace_back("Backend");
-  backend_headers.emplace_back("Config");
-  backend_headers.emplace_back("Path");
-
-  triton::common::TablePrinter backends_table(backend_headers);
-
-  std::unique_ptr<std::unordered_map<std::string, std::vector<std::string>>>
-      backend_state;
-  RETURN_IF_ERROR(TritonBackendManager::BackendState(&backend_state));
-
-  for (const auto& backend_pair : *backend_state) {
-    std::vector<std::string> backend_record;
-
-    // Backend Name
-    backend_record.emplace_back(backend_pair.first);
-
-    // Backend config and lib path
-    for (const auto& backend_field : backend_pair.second) {
-      backend_record.emplace_back(backend_field);
-    }
-    backends_table.InsertRow(backend_record);
-  }
-  std::string backends_table_string = backends_table.PrintTable();
-  LOG_INFO << backends_table_string;
-
-  // Models Summary
-  auto model_states = model_repository_manager_->BackendStates();
-
-  std::vector<std::string> model_headers;
-  model_headers.emplace_back("Model");
-  model_headers.emplace_back("Version");
-  model_headers.emplace_back("Status");
-
-  triton::common::TablePrinter models_table(model_headers);
-
-  for (const auto& model_state : model_states) {
-    auto model_version_map = model_state.second;
-    std::string model_name = model_state.first;
-
-    // If model_version_map size is zero, no version is found for this model
-    if (model_version_map.size() == 0) {
-      std::vector<std::string> model_record;
-      model_record.emplace_back(model_name);
-      model_record.emplace_back("-");
-      model_record.emplace_back("Not loaded: No model version was found");
-      models_table.InsertRow(model_record);
-    } else {
-      for (const auto& model_map : model_version_map) {
-        std::vector<std::string> model_record;
-        std::string model_version = std::to_string(model_map.first);
-        auto model_status_pair = model_map.second;
-        std::string model_status =
-            ModelReadyStateString(model_status_pair.first);
-
-        if (model_status_pair.second != "") {
-          model_status += ": " + model_status_pair.second;
-        }
-
-        model_record.emplace_back(model_name);
-        model_record.emplace_back(model_version);
-        model_record.emplace_back(model_status);
-        models_table.InsertRow(model_record);
-      }
-    }
-  }
-  std::string models_table_string = models_table.PrintTable();
-  LOG_INFO << models_table_string;
-
-  return Status::Success;
-}
-
-Status
 InferenceServer::Init()
 {
   Status status;
@@ -198,6 +126,18 @@ InferenceServer::Init()
         Status::Code::INVALID_ARG, "--model-repository must be specified");
   }
 
+  // Some backends have difficulty being loaded/unloaded dynamically,
+  // for example, non-deterministic hanging while trying to initialize
+  // a shared library. The hangs seems to be related to other
+  // simultaneous activity, so to avoid we synchronously load these
+  // backends once at server startup and leave them loaded (by
+  // maintaining a reference to them).
+  status = InitPersistentBackends();
+  if (!status.IsOk()) {
+    ready_state_ = ServerReadyState::SERVER_FAILED_TO_INITIALIZE;
+    return status;
+  }
+
   PinnedMemoryManager::Options options(pinned_memory_pool_size_);
   status = PinnedMemoryManager::Create(options);
   if (!status.IsOk()) {
@@ -206,8 +146,8 @@ InferenceServer::Init()
   }
 
 #ifdef TRITON_ENABLE_GPU
-  // Defer the setting of default CUDA memory pool value here as
-  // 'min_supported_compute_capability_' is finalized
+  // Set the default CUDA memory pool size for GPUs where it is not
+  // set explicitly.
   std::set<int> supported_gpus;
   if (GetSupportedGPUs(&supported_gpus, min_supported_compute_capability_)
           .IsOk()) {
@@ -226,7 +166,6 @@ InferenceServer::Init()
     LOG_ERROR << status.Message();
   }
 #endif  // TRITON_ENABLE_GPU
-
 
   status = EnablePeerAccess(min_supported_compute_capability_);
   if (!status.IsOk()) {
@@ -261,6 +200,63 @@ InferenceServer::Init()
   }
 
   return status;
+}
+
+Status
+InferenceServer::InitPersistentBackends()
+{
+  // FIXME need some cross-InstanceServer singleton to manage the
+  // persistent backends
+  static std::mutex persist_backends_mu;
+  std::lock_guard<std::mutex> lock(persist_backends_mu);
+  static std::list<std::shared_ptr<TritonBackend>> persist_backends;
+  if (persist_backends.empty()) {
+    for (const auto& be : {"pytorch", "tensorflow", "onnxruntime"}) {
+      RETURN_IF_ERROR(InitPersistentBackend(&persist_backends, be));
+    }
+  }
+
+  return Status::Success;
+}
+
+Status
+InferenceServer::InitPersistentBackend(
+    std::list<std::shared_ptr<TritonBackend>>* persist_backends,
+    const std::string& backend_name)
+{
+  std::string backends_dir;
+  std::string specialized_backend_name;
+  std::string backend_libname;
+  RETURN_IF_ERROR(BackendConfigurationGlobalBackendsDirectory(
+      backend_cmdline_config_map_, &backends_dir));
+  RETURN_IF_ERROR(BackendConfigurationSpecializeBackendName(
+      backend_cmdline_config_map_, backend_name, &specialized_backend_name));
+  RETURN_IF_ERROR(BackendConfigurationBackendLibraryName(
+      specialized_backend_name, &backend_libname));
+
+  const auto backend_dir = JoinPath({backends_dir, specialized_backend_name});
+  const auto backend_libpath =
+      JoinPath({backend_dir, backend_libname});
+  bool exists = false;
+  RETURN_IF_ERROR(FileExists(backend_libpath, &exists));
+  if (exists) {
+    BackendCmdlineConfig empty_backend_cmdline_config;
+    const BackendCmdlineConfig* config;
+    const auto& itr = backend_cmdline_config_map_.find(backend_name);
+    if (itr == backend_cmdline_config_map_.end()) {
+      config = &empty_backend_cmdline_config;
+    } else {
+      config = &itr->second;
+    }
+
+    std::shared_ptr<TritonBackend> persist_backend;
+    RETURN_IF_ERROR(TritonBackendManager::CreateBackend(
+        backend_name, backend_dir, backend_libpath, *config,
+        &persist_backend));
+    persist_backends->push_back(persist_backend);
+  }
+
+  return Status::Success;
 }
 
 Status
@@ -523,4 +519,79 @@ InferenceServer::UnloadModel(const std::string& model_name)
   return model_repository_manager_->LoadUnloadModel(model_name, action_type);
 }
 
+Status
+InferenceServer::PrintBackendAndModelSummary()
+{
+  // Backends Summary
+  std::vector<std::string> backend_headers;
+  backend_headers.emplace_back("Backend");
+  backend_headers.emplace_back("Config");
+  backend_headers.emplace_back("Path");
+
+  triton::common::TablePrinter backends_table(backend_headers);
+
+  std::unique_ptr<std::unordered_map<std::string, std::vector<std::string>>>
+      backend_state;
+  RETURN_IF_ERROR(TritonBackendManager::BackendState(&backend_state));
+
+  for (const auto& backend_pair : *backend_state) {
+    std::vector<std::string> backend_record;
+
+    // Backend Name
+    backend_record.emplace_back(backend_pair.first);
+
+    // Backend config and lib path
+    for (const auto& backend_field : backend_pair.second) {
+      backend_record.emplace_back(backend_field);
+    }
+    backends_table.InsertRow(backend_record);
+  }
+  std::string backends_table_string = backends_table.PrintTable();
+  LOG_INFO << backends_table_string;
+
+  // Models Summary
+  auto model_states = model_repository_manager_->BackendStates();
+
+  std::vector<std::string> model_headers;
+  model_headers.emplace_back("Model");
+  model_headers.emplace_back("Version");
+  model_headers.emplace_back("Status");
+
+  triton::common::TablePrinter models_table(model_headers);
+
+  for (const auto& model_state : model_states) {
+    auto model_version_map = model_state.second;
+    std::string model_name = model_state.first;
+
+    // If model_version_map size is zero, no version is found for this model
+    if (model_version_map.size() == 0) {
+      std::vector<std::string> model_record;
+      model_record.emplace_back(model_name);
+      model_record.emplace_back("-");
+      model_record.emplace_back("Not loaded: No model version was found");
+      models_table.InsertRow(model_record);
+    } else {
+      for (const auto& model_map : model_version_map) {
+        std::vector<std::string> model_record;
+        std::string model_version = std::to_string(model_map.first);
+        auto model_status_pair = model_map.second;
+        std::string model_status =
+            ModelReadyStateString(model_status_pair.first);
+
+        if (model_status_pair.second != "") {
+          model_status += ": " + model_status_pair.second;
+        }
+
+        model_record.emplace_back(model_name);
+        model_record.emplace_back(model_version);
+        model_record.emplace_back(model_status);
+        models_table.InsertRow(model_record);
+      }
+    }
+  }
+  std::string models_table_string = models_table.PrintTable();
+  LOG_INFO << models_table_string;
+
+  return Status::Success;
+}
 }}  // namespace nvidia::inferenceserver

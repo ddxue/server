@@ -28,11 +28,13 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <atomic>
+#include <list>
 #include <map>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "src/backends/backend/triton_backend_manager.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/model_repository_manager.h"
 #include "src/core/status.h"
@@ -97,9 +99,6 @@ class InferenceServer {
   Status ModelReadyVersions(
       std::map<std::string, std::vector<int64_t>>* model_versions);
 
-  // Print backends and models summary
-  Status PrintBackendAndModelSummary();
-
   /// Get the index of all models in all repositories.
   /// \param ready_only If true return only index of models that are ready.
   /// \param index Returns the index.
@@ -119,6 +118,9 @@ class InferenceServer {
 
   // Unload the corresponding model.
   Status UnloadModel(const std::string& model_name);
+
+  // Print backends and models summary
+  Status PrintBackendAndModelSummary();
 
   // Return the server version.
   const std::string& Version() const { return version_; }
@@ -225,6 +227,11 @@ class InferenceServer {
   }
 
  private:
+  Status InitPersistentBackends();
+  Status InitPersistentBackend(
+      std::list<std::shared_ptr<TritonBackend>>* persist_backends,
+      const std::string& backend_name);
+
   const std::string version_;
   std::string id_;
   std::vector<const char*> extensions_;
