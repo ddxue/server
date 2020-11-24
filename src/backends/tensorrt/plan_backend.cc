@@ -887,12 +887,14 @@ PlanBackend::Context::InitializeShapeInputBinding(
     // been correctly initalized so even for zero-sized tensors always allocate
     // something.
     bool zero_copy_support = false;
-    RETURN_IF_ERROR(SupportsIntegratedZeroCopy(gpu_device_, &zero_copy_support));
+    RETURN_IF_ERROR(
+        SupportsIntegratedZeroCopy(gpu_device_, &zero_copy_support));
     void* buffer = nullptr;
     cudaError_t err = cudaSuccess;
     if (zero_copy_support) {
       err = cudaHostAlloc(
-          &buffer, std::max((int64_t)1, max_byte_size), cudaHostAllocMapped);
+          &buffer, std::max((int64_t)1, max_byte_size),
+          cudaHostAllocPortable | cudaHostAllocMapped);
     } else {
       err = cudaMalloc(&buffer, std::max((int64_t)1, max_byte_size));
     }
@@ -1108,7 +1110,8 @@ PlanBackend::Context::InitializeExecuteInputBinding(
   cudaError_t err = cudaSuccess;
   if (zero_copy_support) {
     err = cudaHostAlloc(
-        &buffer, std::max((int64_t)1, max_byte_size), cudaHostAllocMapped);
+        &buffer, std::max((int64_t)1, max_byte_size),
+        cudaHostAllocPortable | cudaHostAllocMapped);
   } else {
     err = cudaMalloc(&buffer, std::max((int64_t)1, max_byte_size));
   }
@@ -1246,10 +1249,10 @@ PlanBackend::Context::InitializeBatchInputBindings(
       if (io_binding_info.memory_type_ != TRITONSERVER_MEMORY_GPU) {
         // zero-copy is used so the input buffer is direct-writable
         io_binding_info.batch_input_.reset(new BatchInputData(
-            batch_input,
-            new MutableMemory(
-                reinterpret_cast<char*>(io_binding_info.buffer_), io_binding_info.byte_size_,
-                TRITONSERVER_MEMORY_CPU_PINNED, 0)));
+            batch_input, new MutableMemory(
+                             reinterpret_cast<char*>(io_binding_info.buffer_),
+                             io_binding_info.byte_size_,
+                             TRITONSERVER_MEMORY_CPU_PINNED, 0)));
       } else {
         io_binding_info.batch_input_.reset(new BatchInputData(
             batch_input, new AllocatedMemory(
@@ -1393,12 +1396,14 @@ PlanBackend::Context::InitializeConfigShapeOutputBindings(
       // been correctly initalized so even for zero-sized tensors always
       // allocate something.
       bool zero_copy_support = false;
-      RETURN_IF_ERROR(SupportsIntegratedZeroCopy(gpu_device_, &zero_copy_support));
+      RETURN_IF_ERROR(
+          SupportsIntegratedZeroCopy(gpu_device_, &zero_copy_support));
       void* buffer = nullptr;
       cudaError_t err = cudaSuccess;
       if (zero_copy_support) {
         err = cudaHostAlloc(
-            &buffer, std::max((int64_t)1, max_byte_size), cudaHostAllocMapped);
+            &buffer, std::max((int64_t)1, max_byte_size),
+            cudaHostAllocPortable | cudaHostAllocMapped);
       } else {
         err = cudaMalloc(&buffer, std::max((int64_t)1, max_byte_size));
       }
@@ -1547,12 +1552,14 @@ PlanBackend::Context::InitializeConfigExecuteOutputBindings(
     // been correctly initalized so even for zero-sized tensors always allocate
     // something.
     bool zero_copy_support = false;
-    RETURN_IF_ERROR(SupportsIntegratedZeroCopy(gpu_device_, &zero_copy_support));
+    RETURN_IF_ERROR(
+        SupportsIntegratedZeroCopy(gpu_device_, &zero_copy_support));
     void* buffer = nullptr;
     cudaError_t err = cudaSuccess;
     if (zero_copy_support) {
       err = cudaHostAlloc(
-          &buffer, std::max((int64_t)1, max_byte_size), cudaHostAllocMapped);
+          &buffer, std::max((int64_t)1, max_byte_size),
+          cudaHostAllocPortable | cudaHostAllocMapped);
     } else {
       err = cudaMalloc(&buffer, std::max((int64_t)1, max_byte_size));
     }
