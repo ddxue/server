@@ -2627,7 +2627,8 @@ PlanBackend::Context::Run(
       } else {
         collector.ProcessTensor(
             name, datatype, static_cast<char*>(io_binding_info.buffer_),
-            total_byte_size, TRITONSERVER_MEMORY_GPU, gpu_device_);
+            total_byte_size, io_binding_info.memory_type_,
+            io_binding_info.memory_type_id_);
       }
     }
   }
@@ -2872,7 +2873,7 @@ PlanBackend::Context::Run(
           name, io_binding_info.io_shape_mapping_.first, dt,
           io_binding_info.io_shape_mapping_.second,
           static_cast<const char*>(io_binding_info.buffer_),
-          TRITONSERVER_MEMORY_GPU, gpu_device_);
+          io_binding_info.memory_type_, io_binding_info.memory_type_id_);
     } else {
       std::vector<int64_t> batchn_shape;
 
